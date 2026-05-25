@@ -44,8 +44,8 @@ RUN pip install --no-cache-dir -e .
 # Runtime should not run as root. Keep writable app data directories owned by
 # the service user so named Docker volumes inherit usable permissions.
 RUN useradd --create-home --shell /usr/sbin/nologin vibe \
-    && mkdir -p agent/runs agent/sessions agent/uploads agent/.swarm/runs \
-    && chown -R vibe:vibe /app
+    && mkdir -p /home/vibe/.vibe-trading agent/runs agent/sessions agent/uploads agent/.swarm/runs \
+    && chown -R vibe:vibe /app /home/vibe/.vibe-trading
 USER vibe
 
 # Default port

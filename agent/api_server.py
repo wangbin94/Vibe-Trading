@@ -44,6 +44,25 @@ ENV_EXAMPLE_PATH = AGENT_DIR / ".env.example"
 
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB
 _UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB
+DEFAULT_MESSAGE_MAX_LENGTH = 5000
+MESSAGE_MAX_LENGTH_ENV_NAMES = ("VIBE_API_MAX_MESSAGE_CHARS", "VIBE_MESSAGE_MAX_LENGTH")
+
+
+def _read_message_max_length(env: Dict[str, str] | None = None) -> int:
+    values = env if env is not None else os.environ
+    for name in MESSAGE_MAX_LENGTH_ENV_NAMES:
+        raw_value = values.get(name)
+        if raw_value is None or not raw_value.strip():
+            continue
+        try:
+            value = int(raw_value)
+        except ValueError:
+            return DEFAULT_MESSAGE_MAX_LENGTH
+        return value if value > 0 else DEFAULT_MESSAGE_MAX_LENGTH
+    return DEFAULT_MESSAGE_MAX_LENGTH
+
+
+MESSAGE_MAX_LENGTH = _read_message_max_length()
 
 # Rich console for colored logs
 console = Console()
@@ -137,6 +156,7 @@ class HealthResponse(BaseModel):
     status: str = Field(..., description="Service status")
     service: str = Field(..., description="Service name")
     timestamp: str = Field(..., description="Server timestamp")
+    message_max_length: int = Field(..., description="Maximum accepted session message length")
 
 
 class LLMProviderOption(BaseModel):
@@ -223,7 +243,12 @@ class SessionResponse(BaseModel):
 
 class SendMessageRequest(BaseModel):
     """Send chat message: natural-language strategy description."""
-    content: str = Field(..., description="Natural language strategy description", min_length=1, max_length=5000)
+    content: str = Field(
+        ...,
+        description="Natural language strategy description",
+        min_length=1,
+        max_length=MESSAGE_MAX_LENGTH,
+    )
 
 
 class MessageResponse(BaseModel):
@@ -1178,7 +1203,8 @@ async def health_check():
     return HealthResponse(
         status="healthy",
         service="Vibe-Trading API",
-        timestamp=datetime.now().isoformat()
+        timestamp=datetime.now().isoformat(),
+        message_max_length=MESSAGE_MAX_LENGTH,
     )
 
 

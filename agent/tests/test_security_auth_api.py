@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 from types import SimpleNamespace
 
@@ -41,6 +42,32 @@ def test_local_dev_write_allowed_when_key_unset() -> None:
     response = _local_client().post("/sessions", json={})
 
     assert response.status_code in {201, 501}
+
+
+def test_message_max_length_defaults_and_env_aliases() -> None:
+    assert api_server._read_message_max_length({}) == 5000
+    assert api_server._read_message_max_length({"VIBE_API_MAX_MESSAGE_CHARS": "8000"}) == 8000
+    assert api_server._read_message_max_length({"VIBE_MESSAGE_MAX_LENGTH": "7000"}) == 7000
+    assert api_server._read_message_max_length(
+        {
+            "VIBE_API_MAX_MESSAGE_CHARS": "8000",
+            "VIBE_MESSAGE_MAX_LENGTH": "7000",
+        }
+    ) == 8000
+    assert api_server._read_message_max_length({"VIBE_API_MAX_MESSAGE_CHARS": "0"}) == 5000
+    assert api_server._read_message_max_length({"VIBE_API_MAX_MESSAGE_CHARS": "bad"}) == 5000
+
+
+def test_health_exposes_message_max_length() -> None:
+    response = asyncio.run(api_server.health_check())
+
+    assert response.message_max_length == api_server.MESSAGE_MAX_LENGTH
+
+
+def test_send_message_rejects_content_over_configured_max_length() -> None:
+    with pytest.raises(ValueError):
+        api_server.SendMessageRequest(content="x" * (api_server.MESSAGE_MAX_LENGTH + 1))
+    api_server.SendMessageRequest(content="x" * api_server.MESSAGE_MAX_LENGTH)
 
 
 def test_docker_gateway_dev_write_allowed_only_with_compose_trust_flag(

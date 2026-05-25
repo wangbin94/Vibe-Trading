@@ -7,7 +7,9 @@ services:
       - agent/.env
     environment:
       - VIBE_TRADING_TRUST_DOCKER_LOOPBACK=1
+      - VIBE_API_MAX_MESSAGE_CHARS=${VIBE_API_MAX_MESSAGE_CHARS:-5000}
     volumes:
+      - vibe-config:/home/vibe/.vibe-trading
       - vibe-runs:/app/agent/runs
       - vibe-sessions:/app/agent/sessions
     restart: unless-stopped
@@ -29,5 +31,6 @@ services:
         condition: service_started
 
 volumes:
+  vibe-config:
   vibe-runs:
   vibe-sessions:
