@@ -528,6 +528,12 @@ def _replay_context_result(result: str) -> str:
     return json.dumps(replay_payload, ensure_ascii=False)
 
 
+
+def _bound_frozen_review_context(messages: list) -> None:
+    if len(json.dumps(messages, default=str, ensure_ascii=False)) > 320_000:
+        raise ValueError("frozen_review_context_budget_exceeded")
+
+
 def _microcompact(
     messages: list,
     *,
@@ -916,6 +922,7 @@ class AgentLoop:
         event_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         max_iterations: int = 50,
         persistent_memory: Optional[Any] = None,
+        frozen_review_context: bool = False,
     ) -> None:
         """Initialize AgentLoop.
 
@@ -966,6 +973,7 @@ class AgentLoop:
         self._cancel_event = threading.Event()
         self._previous_summary: str = ""
         self._persistent_memory = persistent_memory
+        self._frozen_review_context = frozen_review_context
         self._run_iteration: int = 0
         self._has_run = False
         self._grounding: GroundingLedger | None = None
@@ -1233,23 +1241,27 @@ class AgentLoop:
                     notif_text = "\n".join(f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs)
                     messages.append({"role": "user", "content": f"<background-results>\n{notif_text}\n</background-results>\n\n<system>Continue processing with the background results above.</system>"})
 
-                if _override("TOKEN_THRESHOLD") is not None:
-                    # Test hook: a monkeypatched module-level TOKEN_THRESHOLD
-                    # keeps the old estimate-based layers so compaction tests
-                    # can force each layer with a tiny number.
-                    tokens = estimate_tokens(messages)
-                    if tokens > int(_token_threshold() * 0.5):
-                        self._microcompact_and_unblock(messages, trace, iteration)
-                        tokens = estimate_tokens(messages)
-                    if tokens > int(_token_threshold() * 0.7):
-                        _context_collapse(messages)
-                        tokens = estimate_tokens(messages)
-                    _tok_threshold = _token_threshold()
-                    if tokens > _tok_threshold:
-                        logger.info(f"Auto compact triggered: {tokens} tokens > {_tok_threshold}")
-                        self._auto_compact(messages, run_dir, trace, iteration=current_iter)
+                if self._frozen_review_context:
+                    # Keep authenticated daily pages until synthesis; never silently trim.
+                    _bound_frozen_review_context(messages)
                 else:
-                    self._compact_to_budget(messages, run_dir, trace, iteration, current_iter)
+                    if _override("TOKEN_THRESHOLD") is not None:
+                        # Test hook: a monkeypatched module-level TOKEN_THRESHOLD
+                        # keeps the old estimate-based layers so compaction tests
+                        # can force each layer with a tiny number.
+                        tokens = estimate_tokens(messages)
+                        if tokens > int(_token_threshold() * 0.5):
+                            self._microcompact_and_unblock(messages, trace, iteration)
+                            tokens = estimate_tokens(messages)
+                        if tokens > int(_token_threshold() * 0.7):
+                            _context_collapse(messages)
+                            tokens = estimate_tokens(messages)
+                        _tok_threshold = _token_threshold()
+                        if tokens > _tok_threshold:
+                            logger.info(f"Auto compact triggered: {tokens} tokens > {_tok_threshold}")
+                            self._auto_compact(messages, run_dir, trace, iteration=current_iter)
+                    else:
+                        self._compact_to_budget(messages, run_dir, trace, iteration, current_iter)
 
                 logger.info(f"ReAct iteration {iteration}/{self.max_iterations}")
 
@@ -2046,6 +2058,8 @@ class AgentLoop:
 
                 # Layer 3: compress after all tools have executed
                 if compact_requested:
+                    if self._frozen_review_context:
+                        raise ValueError("frozen_review_context_disallows_compaction")
                     logger.info("Manual compact triggered by model")
                     self._auto_compact(messages, run_dir, trace, focus_topic=focus_topic, iteration=current_iter)
 

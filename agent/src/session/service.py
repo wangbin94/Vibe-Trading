@@ -487,7 +487,8 @@ class SessionService:
         from src.config.loader import load_runtime_agent_config, sanitize_session_overrides
 
         llm = ChatLLM()
-        pm = PersistentMemory()
+        frozen_review_context = bool(session_config and session_config.get("frozen_review_context") is True)
+        pm = None if frozen_review_context else PersistentMemory()
 
         session_id = attempt.session_id
         attempt_id = attempt.attempt_id
@@ -495,7 +496,8 @@ class SessionService:
         tool_trail: list[Dict[str, Any]] = []
         checkpoint = ResponseCheckpoint(self.store, attempt)
 
-        safe_overrides = sanitize_session_overrides(session_config) if session_config else session_config
+        configuration = {k: v for k, v in (session_config or {}).items() if k != "frozen_review_context"}
+        safe_overrides = sanitize_session_overrides(configuration) if configuration else configuration
         agent_config = load_runtime_agent_config(overrides=safe_overrides)
 
         def event_callback(event_type: str, data: Dict[str, Any]) -> None:
@@ -531,12 +533,22 @@ class SessionService:
             ),
         )
 
+        if frozen_review_context:
+            from src.agent.tools import ToolRegistry
+            scoped = ToolRegistry()
+            tool = registry.get("mcp_trading_copilot_tc_get_daily_review_evidence")
+            if tool is None:
+                raise ValueError("frozen_daily_review_tool_unavailable")
+            scoped.register(tool)
+            registry = scoped
+
         agent = AgentLoop(
             registry=registry,
             llm=llm,
             event_callback=event_callback,
             max_iterations=50,
             persistent_memory=pm,
+            **({"frozen_review_context": True} if frozen_review_context else {}),
         )
         self._active_loops[session_id] = agent
 
