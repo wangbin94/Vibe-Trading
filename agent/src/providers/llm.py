@@ -122,6 +122,33 @@ class _ResponsesMappingEvent:
         return dict(self._values)
 
 
+class ResponsesStreamFailure(RuntimeError):
+    """A failed Responses event must not disappear as an empty completion."""
+
+    def __init__(self, event: Any) -> None:
+        def field(value: Any, key: str, default: Any = None) -> Any:
+            return value.get(key, default) if isinstance(value, Mapping) else getattr(value, key, default)
+
+        response = field(event, "response", {})
+        error = field(response, "error") or field(event, "error") or event
+        code = str(field(error, "code", "unknown") or "unknown")
+        message = str(field(error, "message", "Responses stream failed") or "Responses stream failed")
+        # These are protocol error fields only; no request, credential or raw
+        # reasoning payload is included. ProviderStreamError redacts the message.
+        self.code = code
+        self.response_id = field(response, "id")
+        self.status_code = {
+            "invalid_request_error": 400,
+            "context_length_exceeded": 400,
+            "insufficient_quota": 402,
+            "authentication_error": 401,
+            "permission_denied": 403,
+            "rate_limit_exceeded": 429,
+            "server_error": 500,
+        }.get(code)
+        super().__init__(f"responses_stream_failed code={code}: {message}")
+
+
 def _normalize_responses_stream_event(event: Any) -> Any:
     """Adapt raw mapping events to the attribute shape LangChain expects.
 
@@ -131,6 +158,9 @@ def _normalize_responses_stream_event(event: Any) -> Any:
     nested attributes directly. Preserve typed events unchanged and adapt only
     the mapping form.
     """
+    event_type = event.get("type") if isinstance(event, Mapping) else getattr(event, "type", None)
+    if event_type in {"response.failed", "error"}:
+        raise ResponsesStreamFailure(event)
     if not isinstance(event, Mapping):
         return event
 
@@ -158,8 +188,13 @@ class _ResponsesSyncStream:
 
     def __iter__(self) -> Iterator[Any]:
         source = self._entered if self._entered is not None else self._stream
+        terminal = False
         for event in source:
-            yield _normalize_responses_stream_event(event)
+            normalized = _normalize_responses_stream_event(event)
+            terminal = terminal or getattr(normalized, "type", None) in {"response.completed", "response.incomplete"}
+            yield normalized
+        if not terminal:
+            raise ResponsesStreamFailure({"code": "stream_incomplete", "message": "Responses stream ended without a terminal event"})
 
     def parse(self, *args: Any, **kwargs: Any) -> "_ResponsesSyncStream":
         """Keep raw-response ``parse()`` streams behind the same proxy."""
@@ -188,8 +223,13 @@ class _ResponsesAsyncStream:
 
     async def _iterate(self) -> AsyncIterator[Any]:
         source = self._entered if self._entered is not None else self._stream
+        terminal = False
         async for event in source:
-            yield _normalize_responses_stream_event(event)
+            normalized = _normalize_responses_stream_event(event)
+            terminal = terminal or getattr(normalized, "type", None) in {"response.completed", "response.incomplete"}
+            yield normalized
+        if not terminal:
+            raise ResponsesStreamFailure({"code": "stream_incomplete", "message": "Responses stream ended without a terminal event"})
 
     def parse(self, *args: Any, **kwargs: Any) -> "_ResponsesAsyncStream":
         """Keep async raw-response ``parse()`` streams behind the proxy."""

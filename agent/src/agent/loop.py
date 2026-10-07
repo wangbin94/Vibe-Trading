@@ -1429,6 +1429,13 @@ class AgentLoop:
                         should_cancel=self._cancel_event.is_set,
                     )
                 except ProviderStreamError as exc:
+                    trace.write({
+                        "type": "provider_stream_failure",
+                        "iter": current_iter,
+                        "reason": str(exc),
+                        "status_code": exc.status_code,
+                        "retryable": exc.retryable,
+                    })
                     # One retry for transient mid-stream failures (connection
                     # reset, relay hiccup) — mirrors the swarm worker policy.
                     # Deterministic 4xx errors fail immediately. Deltas from
@@ -1648,6 +1655,9 @@ class AgentLoop:
                             {
                                 "type": "empty_model_response",
                                 "iter": current_iter,
+                                "finish_reason": getattr(response, "finish_reason", None),
+                                "usage": getattr(response, "usage_metadata", None),
+                                "response_model": getattr(response, "response_model", None),
                                 "provider": get_env_config().llm.langchain_provider,
                                 "model": getattr(self.llm, "model_name", None) or get_env_config().llm.langchain_model_name,
                             }

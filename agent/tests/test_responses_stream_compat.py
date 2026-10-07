@@ -67,13 +67,25 @@ def _text_delta_event() -> dict[str, Any]:
     }
 
 
+def _completed_event() -> dict[str, Any]:
+    return {"type": "response.completed", "response": {
+        "id": "resp_1", "object": "response", "created_at": 1, "status": "completed",
+        "model": "gateway-reasoning-model", "output": [], "tools": [], "tool_choice": "auto",
+        "parallel_tool_calls": True, "error": None, "incomplete_details": None,
+        "instructions": None, "metadata": {}, "temperature": 1, "top_p": 1,
+        "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3,
+                  "input_tokens_details": {"cached_tokens": 0},
+                  "output_tokens_details": {"reasoning_tokens": 0}},
+    }}
+
+
 @pytest.mark.skipif(
     ChatOpenAIWithReasoning is None,
     reason="langchain-openai is not installed",
 )
 def test_responses_stream_accepts_mapping_events() -> None:
     """OpenAI-compatible gateways may yield dicts instead of SDK event objects."""
-    events = [_text_delta_event()]
+    events = [_text_delta_event(), _completed_event()]
     llm = ChatOpenAIWithReasoning(
         model="gateway-reasoning-model",
         api_key="sk-test",
@@ -104,7 +116,7 @@ def test_async_responses_stream_accepts_mapping_events() -> None:
         api_key="sk-test",
         use_responses_api=True,
     )
-    llm.root_async_client = _MappingAsyncRootClient([_text_delta_event()])
+    llm.root_async_client = _MappingAsyncRootClient([_text_delta_event(), _completed_event()])
     llm._get_request_payload = lambda *args, **kwargs: {
         "model": "gateway-reasoning-model",
         "input": [{"role": "user", "content": "hello"}],
@@ -136,3 +148,67 @@ def test_responses_payload_does_not_assume_chat_messages() -> None:
 
     assert payload["input"]
     assert payload["reasoning"] == {"effort": "high"}
+
+
+@pytest.mark.parametrize("event_type", ["response.failed", "error"])
+@pytest.mark.parametrize("typed", [False, True])
+def test_failed_response_events_are_not_silently_dropped(event_type: str, typed: bool) -> None:
+    from types import SimpleNamespace
+    from src.providers.llm import ResponsesStreamFailure, _normalize_responses_stream_event
+
+    error = {"code": "server_error", "message": "upstream unavailable"}
+    event = {"type": event_type, "response": {"id": "resp_failed", "error": error}}
+    if typed:
+        event = SimpleNamespace(type=event_type, response=SimpleNamespace(id="resp_failed", error=SimpleNamespace(**error)))
+    with pytest.raises(ResponsesStreamFailure, match="server_error: upstream unavailable") as caught:
+        _normalize_responses_stream_event(event)
+    assert caught.value.status_code == 500
+    assert caught.value.response_id == "resp_failed"
+
+
+def test_failed_response_stream_preserves_provider_error_classification() -> None:
+    from src.providers.chat import ChatLLM, ProviderStreamError
+
+    llm = ChatOpenAIWithReasoning(model="gateway-model", api_key="sk-test", use_responses_api=True)
+    llm.root_client = _MappingRootClient([
+        {"type": "response.failed", "response": {"error": {"code": "invalid_request_error", "message": "bad input"}}},
+    ])
+    client = ChatLLM.__new__(ChatLLM)
+    client.model_name = "gateway-model"
+    client._llm = llm
+    with pytest.raises(ProviderStreamError, match="responses_stream_failed") as caught:
+        client.stream_chat([{"role": "user", "content": "hello"}])
+    assert caught.value.status_code == 400
+    assert caught.value.retryable is False
+
+
+def test_async_failed_response_stream_raises_original_failure() -> None:
+    from src.providers.llm import ResponsesStreamFailure
+
+    llm = ChatOpenAIWithReasoning(model="gateway-model", api_key="sk-test", use_responses_api=True)
+    llm.root_async_client = _MappingAsyncRootClient([
+        {"type": "response.failed", "response": {"error": {"code": "server_error", "message": "upstream unavailable"}}},
+    ])
+
+    async def collect():
+        return [chunk async for chunk in llm.astream("hello")]
+
+    with pytest.raises(ResponsesStreamFailure, match="upstream unavailable"):
+        asyncio.run(collect())
+
+
+@pytest.mark.parametrize("events", [[], [{"type": "response.created", "response": {"id": "resp_1"}}], [_text_delta_event()]])
+def test_sync_truncated_response_stream_is_not_accepted(events) -> None:
+    from src.providers.llm import _ResponsesSyncStream, ResponsesStreamFailure
+    with _MappingResponses(events).create() as stream:
+        with pytest.raises(ResponsesStreamFailure, match="stream_incomplete"):
+            list(_ResponsesSyncStream(stream))
+
+
+def test_async_truncated_response_stream_is_not_accepted() -> None:
+    from src.providers.llm import _ResponsesAsyncStream, ResponsesStreamFailure
+    async def collect():
+        stream = _ResponsesAsyncStream(_MappingAsyncStream([_text_delta_event()]))
+        return [event async for event in stream]
+    with pytest.raises(ResponsesStreamFailure, match="stream_incomplete"):
+        asyncio.run(collect())
