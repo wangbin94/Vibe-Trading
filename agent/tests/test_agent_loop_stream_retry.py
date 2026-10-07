@@ -111,6 +111,7 @@ def _run(
     tmp_path: Path,
     llm: _FlakyLoopLLM,
     events: list[tuple[str, dict[str, Any]]] | None = None,
+    frozen: bool = False,
 ) -> dict[str, Any]:
     """Run an AgentLoop turn against the given scripted LLM.
 
@@ -128,9 +129,10 @@ def _run(
     from src.tools import build_registry
 
     monkeypatch.setattr(loop_mod, "STREAM_RETRY_DELAY_S", 0.0)
-    pm = PersistentMemory()
+    from src.agent.tools import ToolRegistry
+    pm = None if frozen else PersistentMemory()
     agent = AgentLoop(
-        registry=build_registry(persistent_memory=pm, include_shell_tools=False),
+        registry=ToolRegistry() if frozen else build_registry(persistent_memory=pm, include_shell_tools=False),
         llm=llm,
         event_callback=(
             (lambda event_type, data: events.append((event_type, data)))
@@ -139,6 +141,7 @@ def _run(
         ),
         max_iterations=3,
         persistent_memory=pm,
+        frozen_review_context=frozen,
     )
     run_dir = tmp_path / "run"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -192,4 +195,30 @@ def test_non_retryable_4xx_fails_without_retry(monkeypatch, tmp_path: Path) -> N
 
     assert result["status"] == "failed"
     assert result["error_code"] == "provider_stream_error"
+    assert llm.calls == 1
+
+
+@pytest.mark.parametrize("configured,failures,expected_calls,expected_status", [
+    (2, 2, 3, "success"),
+    (2, 3, 3, "failed"),
+    (0, 1, 1, "failed"),
+    (8, 3, 3, "failed"),
+])
+def test_frozen_review_stream_retries_respect_configuration_and_hard_cap(
+    monkeypatch, tmp_path, configured, failures, expected_calls, expected_status,
+):
+    from src.config.accessor import get_env_config
+    monkeypatch.setattr(get_env_config().llm, "max_retries", configured)
+    llm = _FlakyLoopLLM([_transient_error() for _ in range(failures)], "Final answer.")
+    result = _run(monkeypatch, tmp_path, llm, frozen=True)
+    assert result["status"] == expected_status
+    assert llm.calls == expected_calls
+    if expected_status == "success":
+        assert result["content"] == "Final answer."
+
+
+def test_frozen_review_never_retries_deterministic_request_failure(monkeypatch, tmp_path):
+    llm = _FlakyLoopLLM([_bad_request_error()], "Final answer.")
+    result = _run(monkeypatch, tmp_path, llm, frozen=True)
+    assert result["status"] == "failed"
     assert llm.calls == 1

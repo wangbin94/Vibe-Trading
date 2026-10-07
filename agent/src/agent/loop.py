@@ -1418,92 +1418,98 @@ class AgentLoop:
                 _llm_timeout_s = _llm_timeout_seconds()
                 llm_timeout = _llm_timeout_s if _llm_timeout_s > 0 else None
 
-                try:
-                    response = self.llm.stream_chat(
-                        messages,
-                        tools=tool_defs,
-                        on_text_chunk=_on_text_chunk,
-                        on_reasoning_chunk=_on_reasoning_chunk,
-                        timeout=llm_timeout,
-                        idle_timeout_s=llm_timeout,
-                        should_cancel=self._cancel_event.is_set,
-                    )
-                except ProviderStreamError as exc:
-                    trace.write({
-                        "type": "provider_stream_failure",
-                        "iter": current_iter,
-                        "reason": str(exc),
-                        "status_code": exc.status_code,
-                        "retryable": exc.retryable,
-                    })
-                    # One retry for transient mid-stream failures (connection
-                    # reset, relay hiccup) — mirrors the swarm worker policy.
-                    # Deterministic 4xx errors fail immediately. Deltas from
-                    # the failed attempt are dropped so the trace does not
-                    # contain duplicated thinking text. The delay escalates
-                    # across consecutive retryable failures, honoring the
-                    # provider's Retry-After header (bounded by the configured
-                    # cap) when present. A successful retry does not reset the
-                    # streak — only a clean first-attempt success does.
-                    context_overflow = is_context_overflow(str(exc))
-                    if not exc.retryable and not context_overflow:
-                        raise
-                    if context_overflow:
-                        # Deterministic, so no backoff: shrink to the limit the
-                        # provider reported and send once more.
-                        self._recover_context_overflow(
-                            exc, messages, run_dir, trace, iteration, current_iter
+                stream_retry_count = 0
+                stream_retry_limit = (
+                    min(2, max(0, get_env_config().llm.max_retries))
+                    if self._frozen_review_context else 1
+                )
+                while True:
+                    try:
+                        response = self.llm.stream_chat(
+                            messages,
+                            tools=tool_defs,
+                            on_text_chunk=_on_text_chunk,
+                            on_reasoning_chunk=_on_reasoning_chunk,
+                            timeout=llm_timeout,
+                            idle_timeout_s=llm_timeout,
+                            should_cancel=self._cancel_event.is_set,
                         )
-                        retry_delay_s = 0.0
-                    else:
-                        stream_failure_streak += 1
-                        retry_delay_s = (
-                            min(exc.retry_after_s, _stream_retry_max_delay_s())
-                            if exc.retry_after_s is not None
-                            else _stream_retry_backoff_s(stream_failure_streak)
-                        )
-                    logger.warning(
-                        "Provider stream failed (iter %s), retrying once in %.2fs: %s",
-                        current_iter,
-                        retry_delay_s,
-                        exc,
-                    )
-                    self._emit(
-                        "stream_reset",
-                        {
+                    except ProviderStreamError as exc:
+                        trace.write({
+                            "type": "provider_stream_failure",
+                            "retry_attempt": stream_retry_count,
                             "iter": current_iter,
-                            "reason": "context_overflow" if context_overflow else "provider_stream_retry",
-                            "provider": exc.provider,
-                            "model": exc.model,
-                            "retry_delay_s": retry_delay_s,
-                        },
-                    )
-                    thinking_chunks.clear()
-                    streamed_chars = 0
-                    stream_total = 0
-                    stream_frozen = False
-                    reasoning_chars = 0
-                    last_reasoning_emit = None
-                    # Wait on the cancel event, not time.sleep: the delay now
-                    # escalates to the configured cap (30s by default) and a
-                    # provider Retry-After can ask for that much on the first
-                    # failure. A blocking sleep would make Stop take that long
-                    # to be observed; the event returns the moment it is set.
-                    self._cancel_event.wait(retry_delay_s)
-                    if self._cancel_event.is_set():
+                            "reason": str(exc),
+                            "status_code": exc.status_code,
+                            "retryable": exc.retryable,
+                        })
+                        # Ordinary turns retain their one-retry policy. Frozen
+                        # daily turns honor the existing MAX_RETRIES configuration,
+                        # capped at two; the outer run still owns the deadline.
+                        # Deterministic 4xx errors fail immediately. Deltas from
+                        # the failed attempt are dropped so the trace does not
+                        # contain duplicated thinking text. The delay escalates
+                        # across consecutive retryable failures, honoring the
+                        # provider's Retry-After header (bounded by the configured
+                        # cap) when present. A successful retry does not reset the
+                        # streak — only a clean first-attempt success does.
+                        context_overflow = is_context_overflow(str(exc))
+                        if stream_retry_count >= stream_retry_limit or (not exc.retryable and not context_overflow):
+                            raise
+                        if context_overflow:
+                            # Deterministic, so no backoff: shrink to the limit the
+                            # provider reported and send once more.
+                            self._recover_context_overflow(
+                                exc, messages, run_dir, trace, iteration, current_iter
+                            )
+                            retry_delay_s = 0.0
+                        else:
+                            stream_failure_streak += 1
+                            retry_delay_s = (
+                                min(exc.retry_after_s, _stream_retry_max_delay_s())
+                                if exc.retry_after_s is not None
+                                else _stream_retry_backoff_s(stream_failure_streak)
+                            )
+                        logger.warning(
+                            "Provider stream failed (iter %s), retrying %s/%s in %.2fs: %s",
+                            current_iter,
+                            stream_retry_count + 1,
+                            stream_retry_limit,
+                            retry_delay_s,
+                            exc,
+                        )
+                        self._emit(
+                            "stream_reset",
+                            {
+                                "iter": current_iter,
+                                "reason": "context_overflow" if context_overflow else "provider_stream_retry",
+                                "provider": exc.provider,
+                                "model": exc.model,
+                                "retry_delay_s": retry_delay_s,
+                                "retry_attempt": stream_retry_count + 1,
+                                "retry_limit": stream_retry_limit,
+                            },
+                        )
+                        thinking_chunks.clear()
+                        streamed_chars = 0
+                        stream_total = 0
+                        stream_frozen = False
+                        reasoning_chars = 0
+                        last_reasoning_emit = None
+                        # Wait on the cancel event, not time.sleep: the delay now
+                        # escalates to the configured cap (30s by default) and a
+                        # provider Retry-After can ask for that much on the first
+                        # failure. A blocking sleep would make Stop take that long
+                        # to be observed; the event returns the moment it is set.
+                        self._cancel_event.wait(retry_delay_s)
+                        if self._cancel_event.is_set():
+                            break
+                        stream_retry_count += 1
+                        continue
+                    else:
+                        if stream_retry_count == 0:
+                            stream_failure_streak = 0
                         break
-                    response = self.llm.stream_chat(
-                        messages,
-                        tools=tool_defs,
-                        on_text_chunk=_on_text_chunk,
-                        on_reasoning_chunk=_on_reasoning_chunk,
-                        timeout=llm_timeout,
-                        idle_timeout_s=llm_timeout,
-                        should_cancel=self._cancel_event.is_set,
-                    )
-                else:
-                    stream_failure_streak = 0
-
                 # Cancelled mid-stream: discard this turn's partial response and
                 # end the run now, without executing any of its tool calls.
                 if self._cancel_event.is_set():
