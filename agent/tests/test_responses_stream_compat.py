@@ -212,3 +212,65 @@ def test_async_truncated_response_stream_is_not_accepted() -> None:
         return [event async for event in stream]
     with pytest.raises(ResponsesStreamFailure, match="stream_incomplete"):
         asyncio.run(collect())
+
+
+def _function_events(count=2, *, deltas=False, terminal_only=False):
+    import json
+    events=[]
+    items=[]
+    for index in range(count):
+        arguments=json.dumps({'source_id':f'page_{index}'})
+        item={'type':'function_call','id':f'fc_{index}','call_id':f'call_{index}','name':'frozen_source','arguments':arguments,'status':'completed'}
+        items.append(item)
+        events.append({'type':'response.output_item.added','output_index':index,'item':{**item,'arguments':''}})
+        if deltas:
+            events.append({'type':'response.function_call_arguments.delta','output_index':index,'delta':arguments[:10]})
+            events.append({'type':'response.function_call_arguments.delta','output_index':index,'delta':arguments[10:]})
+        if not terminal_only:
+            events.append({'type':'response.function_call_arguments.done','output_index':index,'arguments':arguments})
+            events.append({'type':'response.output_item.done','output_index':index,'item':item})
+    end=_completed_event()
+    end['response']['output']=items
+    return [*events,end]
+
+
+@pytest.mark.parametrize('deltas',[False,True])
+@pytest.mark.parametrize('terminal_only',[False,True])
+def test_complete_function_arguments_survive_done_and_terminal_events(deltas,terminal_only):
+    llm=ChatOpenAIWithReasoning(model='gateway-model',api_key='sk-test',use_responses_api=True)
+    llm.root_client=_MappingRootClient(_function_events(62,deltas=deltas,terminal_only=terminal_only))
+    chunks=list(llm.stream('read frozen sources'))
+    merged=chunks[0]
+    for chunk in chunks[1:]: merged+=chunk
+    assert len(merged.tool_calls)==62
+    assert [call['args'] for call in merged.tool_calls]==[{'source_id':f'page_{i}'} for i in range(62)]
+    assert [call['id'] for call in merged.tool_calls]==[f'call_{i}' for i in range(62)]
+
+
+def test_async_complete_function_arguments_survive_typed_done_only_events():
+    from src.providers.llm import _ResponsesMappingEvent
+    events=[_ResponsesMappingEvent({**e,**({'item':_ResponsesMappingEvent(e['item'])} if 'item' in e else {})}) for e in _function_events()]
+    llm=ChatOpenAIWithReasoning(model='gateway-model',api_key='sk-test',use_responses_api=True)
+    llm.root_async_client=_MappingAsyncRootClient(events)
+    async def collect():
+        chunks=[chunk async for chunk in llm.astream('read frozen sources')]
+        merged=chunks[0]
+        for chunk in chunks[1:]:merged+=chunk
+        return merged
+    merged=asyncio.run(collect())
+    assert [call['args'] for call in merged.tool_calls]==[{'source_id':'page_0'},{'source_id':'page_1'}]
+
+
+@pytest.mark.parametrize('conflict',[False,True])
+def test_missing_or_conflicting_function_arguments_fail_before_empty_calls(conflict):
+    from src.providers.llm import _ResponsesSyncStream,ResponsesStreamFailure
+    events=_function_events(1)
+    if conflict:
+        events.insert(1,{'type':'response.function_call_arguments.delta','output_index':0,'delta':'{"other":'})
+    else:
+        events[1]['arguments']=''
+        events[2]['item']['arguments']=''
+        events[3]['response']['output'][0]['arguments']=''
+    with _MappingResponses(events).create() as stream:
+        with pytest.raises(ResponsesStreamFailure,match='tool_arguments_'):
+            list(_ResponsesSyncStream(stream))

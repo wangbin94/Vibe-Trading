@@ -860,7 +860,11 @@ class FrozenDailyReviewEvidenceTool(BaseTool):
         supplied = kwargs.get("run_id")
         if supplied is not None and supplied != self.run_id:
             return json.dumps({"status": "error", "error": "frozen_daily_review_scope_conflict"})
-        if set(kwargs) - {"source_id", "run_id", "run_dir"}:
+        if (
+            set(kwargs) - {"source_id", "run_id", "run_dir"}
+            or not isinstance(kwargs.get("source_id"), str)
+            or not kwargs["source_id"]
+        ):
             return json.dumps({"status": "error", "error": "frozen_daily_review_invalid_arguments"})
         return self._remote.execute(**{**kwargs, "run_id": self.run_id})
 

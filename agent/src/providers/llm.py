@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import uuid
@@ -172,6 +173,80 @@ def _normalize_responses_stream_event(event: Any) -> Any:
     return _ResponsesMappingEvent(values)
 
 
+class _ResponsesFunctionCalls:
+    """Publish complete provider arguments once, including done-only gateways.
+
+    LangChain does not consume function arguments in done/completed events. Hold
+    function fragments until the terminal receipt; preserve their exact identity,
+    order and JSON, and fail on conflicting or incomplete arguments rather than
+    executing an empty call. Text/reasoning events remain streaming.
+    """
+
+    def __init__(self) -> None:
+        self.calls: dict[int, dict[str, Any]] = {}
+
+    @staticmethod
+    def field(value: Any, key: str, default: Any = None) -> Any:
+        return value.get(key, default) if isinstance(value, Mapping) else getattr(value, key, default)
+
+    def feed(self, event: Any) -> list[Any]:
+        event = _normalize_responses_stream_event(event)
+        kind = event.type
+        item = self.field(event, "item")
+        index = self.field(event, "output_index")
+        if kind in {"response.output_item.added", "response.output_item.done"} and self.field(item, "type") == "function_call":
+            values = dict(item) if isinstance(item, Mapping) else item.model_dump()
+            state = self.calls.setdefault(index, {"streamed": ""})
+            state["item"] = values
+            if kind == "response.output_item.done":
+                state["complete"] = values.get("arguments")
+            else:
+                state["streamed"] = values.get("arguments") or ""
+            return []
+        if kind in {"response.function_call_arguments.delta", "response.function_call_arguments.done"}:
+            state = self.calls.setdefault(index, {"streamed": ""})
+            if kind.endswith(".delta"):
+                state["streamed"] += self.field(event, "delta", "")
+            else:
+                state["complete"] = self.field(event, "arguments")
+            return []
+        if kind not in {"response.completed", "response.incomplete"}:
+            return [event]
+
+        # The terminal output is authoritative when present. Gateway fixtures
+        # may instead supply complete arguments in item/arguments.done events.
+        for output_index, output in enumerate(self.field(self.field(event, "response"), "output", []) or []):
+            if self.field(output, "type") != "function_call":
+                continue
+            values = dict(output) if isinstance(output, Mapping) else output.model_dump()
+            state = self.calls.setdefault(output_index, {"streamed": ""})
+            prior = state.get("item")
+            if prior and any(prior.get(key) != values.get(key) for key in ("name", "call_id")):
+                raise ResponsesStreamFailure({"code": "tool_arguments_conflict", "message": "Responses function identity conflicts with its terminal receipt"})
+            state["item"], state["complete"] = values, values.get("arguments")
+        calls = []
+        recovered = 0
+        for output_index, state in sorted(self.calls.items()):
+            values = state.get("item")
+            arguments = state.get("complete", state["streamed"])
+            try:
+                decoded = json.loads(arguments)
+            except (TypeError, ValueError):
+                decoded = None
+            if not values or not isinstance(decoded, dict):
+                raise ResponsesStreamFailure({"code": "tool_arguments_incomplete", "message": "Responses function arguments are missing or not a complete JSON object"})
+            if not arguments.startswith(state["streamed"]):
+                raise ResponsesStreamFailure({"code": "tool_arguments_conflict", "message": "Responses function arguments conflict with streamed fragments"})
+            recovered += len(arguments) > len(state["streamed"])
+            calls.append(_normalize_responses_stream_event({
+                "type": "response.output_item.added", "output_index": output_index,
+                "item": {**values, "arguments": arguments},
+            }))
+        if calls:
+            logger.info("Responses function argument reconciliation: calls=%d completed_receipt_recoveries=%d", len(calls), recovered)
+        return [*calls, event]
+
+
 class _ResponsesSyncStream:
     """Proxy a sync Responses stream and normalize each yielded event."""
 
@@ -189,10 +264,11 @@ class _ResponsesSyncStream:
     def __iter__(self) -> Iterator[Any]:
         source = self._entered if self._entered is not None else self._stream
         terminal = False
+        functions = _ResponsesFunctionCalls()
         for event in source:
-            normalized = _normalize_responses_stream_event(event)
-            terminal = terminal or getattr(normalized, "type", None) in {"response.completed", "response.incomplete"}
-            yield normalized
+            for normalized in functions.feed(event):
+                terminal = terminal or getattr(normalized, "type", None) in {"response.completed", "response.incomplete"}
+                yield normalized
         if not terminal:
             raise ResponsesStreamFailure({"code": "stream_incomplete", "message": "Responses stream ended without a terminal event"})
 
@@ -224,10 +300,11 @@ class _ResponsesAsyncStream:
     async def _iterate(self) -> AsyncIterator[Any]:
         source = self._entered if self._entered is not None else self._stream
         terminal = False
+        functions = _ResponsesFunctionCalls()
         async for event in source:
-            normalized = _normalize_responses_stream_event(event)
-            terminal = terminal or getattr(normalized, "type", None) in {"response.completed", "response.incomplete"}
-            yield normalized
+            for normalized in functions.feed(event):
+                terminal = terminal or getattr(normalized, "type", None) in {"response.completed", "response.incomplete"}
+                yield normalized
         if not terminal:
             raise ResponsesStreamFailure({"code": "stream_incomplete", "message": "Responses stream ended without a terminal event"})
 

@@ -65,6 +65,9 @@ def test_daily_tool_binds_identity_and_never_corrects_conflicting_scope():
     assert json.loads(second.execute(source_id='coverage_1'))['payload']['run_id']=='b'*32
     assert json.loads(first.execute(source_id='overview_1',run_id='b'*32))['status']=='error'
     assert json.loads(first.execute(source_id='overview_1',unsafe='value'))['status']=='error'
+    assert json.loads(first.execute())['status']=='error'
+    assert json.loads(first.execute(source_id=None))['status']=='error'
+    assert json.loads(first.execute(source_id=''))['status']=='error'
     assert len(calls)==2
     for invalid in (None,'','a'*31,'b'*33,'not-a-run'):
         with pytest.raises(ValueError,match='run_id_required'):
