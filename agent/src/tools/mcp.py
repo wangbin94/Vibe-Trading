@@ -834,6 +834,37 @@ class MCPServerAdapter:
                 )
 
 
+class FrozenDailyReviewEvidenceTool(BaseTool):
+    """Bind the immutable run identity from the trusted session, not model text."""
+
+    repeatable = True
+    is_readonly = True
+    parameters = {
+        "type": "object",
+        "properties": {"source_id": {"type": "string"}},
+        "required": ["source_id"],
+        "additionalProperties": False,
+    }
+
+    def __init__(self, remote: BaseTool, run_id: str) -> None:
+        if remote.name != "mcp_trading_copilot_tc_get_daily_review_evidence":
+            raise ValueError("frozen_daily_review_tool_unavailable")
+        if not isinstance(run_id, str) or not re.fullmatch(r"[0-9a-f]{32}", run_id):
+            raise ValueError("frozen_daily_review_run_id_required")
+        self.name = remote.name
+        self.description = "Read one frozen evidence page for this session's bound daily review. Choose source_id only; the runtime supplies the immutable run identity."
+        self._remote = remote
+        self.run_id = run_id
+
+    def execute(self, **kwargs: Any) -> str:
+        supplied = kwargs.get("run_id")
+        if supplied is not None and supplied != self.run_id:
+            return json.dumps({"status": "error", "error": "frozen_daily_review_scope_conflict"})
+        if set(kwargs) - {"source_id", "run_id", "run_dir"}:
+            return json.dumps({"status": "error", "error": "frozen_daily_review_invalid_arguments"})
+        return self._remote.execute(**{**kwargs, "run_id": self.run_id})
+
+
 class MCPRemoteTool(BaseTool):
     """BaseTool wrapper for a discovered remote MCP tool."""
 

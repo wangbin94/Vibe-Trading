@@ -488,6 +488,7 @@ class SessionService:
 
         llm = ChatLLM()
         frozen_review_context = bool(session_config and session_config.get("frozen_review_context") is True)
+        frozen_run_id = (session_config or {}).get("frozen_review_run_id")
         pm = None if frozen_review_context else PersistentMemory()
 
         session_id = attempt.session_id
@@ -496,12 +497,21 @@ class SessionService:
         tool_trail: list[Dict[str, Any]] = []
         checkpoint = ResponseCheckpoint(self.store, attempt)
 
-        configuration = {k: v for k, v in (session_config or {}).items() if k != "frozen_review_context"}
+        configuration = {k: v for k, v in (session_config or {}).items() if k not in {"frozen_review_context", "frozen_review_run_id"}}
         safe_overrides = sanitize_session_overrides(configuration) if configuration else configuration
         agent_config = load_runtime_agent_config(overrides=safe_overrides)
 
         def event_callback(event_type: str, data: Dict[str, Any]) -> None:
             """Forward AgentLoop events to the SSE event bus."""
+            if (
+                frozen_review_context
+                and event_type == "tool_call"
+                and data.get("tool") == "mcp_trading_copilot_tc_get_daily_review_evidence"
+                and isinstance(data.get("arguments"), dict)
+            ):
+                # Persist the identity actually supplied by the bound tool. A
+                # conflicting model-supplied identity stays visible and fails.
+                data["arguments"].setdefault("run_id", frozen_run_id)
             try:
                 checkpoint.handle_event(event_type, data)
             except OSError as exc:
@@ -535,16 +545,15 @@ class SessionService:
 
         if frozen_review_context:
             from src.agent.tools import ToolRegistry
+            from src.tools.mcp import FrozenDailyReviewEvidenceTool
             scoped = ToolRegistry()
             tool = registry.get("mcp_trading_copilot_tc_get_daily_review_evidence")
             if tool is None:
                 raise ValueError("frozen_daily_review_tool_unavailable")
-            # This exact tool reads immutable, scoped evidence only. MCP tools
-            # remain conservative by default; identifying this one as readonly
-            # allows the existing bounded parallel executor to page the day
-            # without serial connection startup consuming the repair deadline.
-            tool.is_readonly = True
-            scoped.register(tool)
+            # The exact readonly tool uses the existing parallel executor, with
+            # its run identity fixed by trusted session config rather than copied
+            # into every model call. Ordinary MCP tools remain conservative.
+            scoped.register(FrozenDailyReviewEvidenceTool(tool, frozen_run_id))
             registry = scoped
 
         agent = AgentLoop(

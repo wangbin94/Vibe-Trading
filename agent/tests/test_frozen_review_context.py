@@ -40,11 +40,37 @@ def test_daily_session_disables_unscoped_memory_and_enables_context_retention(mo
     monkeypatch.setattr('src.agent.loop.AgentLoop',Loop)
     monkeypatch.setattr('src.config.loader.load_runtime_agent_config',lambda overrides=None:object())
     service=SessionService(store=SessionStore(tmp_path/'sessions'),event_bus=EventBus(),runs_dir=tmp_path/'runs')
-    result=asyncio.run(service._run_with_agent(Attempt(session_id='blind',prompt='review'),messages=[],session_config={'frozen_review_context':True}))
+    result=asyncio.run(service._run_with_agent(Attempt(session_id='blind',prompt='review'),messages=[],session_config={'frozen_review_context':True,'frozen_review_run_id':'a'*32}))
     assert result['status']=='completed'
     assert observed['persistent_memory'] is None and observed['frozen_review_context'] is True
     assert set(observed['registry']._tools)=={'mcp_trading_copilot_tc_get_daily_review_evidence'}
     assert observed['registry'].get('mcp_trading_copilot_tc_get_daily_review_evidence').is_readonly is True
+    observed['event_callback']('tool_call',{'tool':'mcp_trading_copilot_tc_get_daily_review_evidence','arguments':{'source_id':'overview_1'},'call_id':'bound'})
+    assert result['tool_trail'][-1]['arguments']['run_id']=='a'*32
+    observed['event_callback']('tool_call',{'tool':'mcp_trading_copilot_tc_get_daily_review_evidence','arguments':{'source_id':'overview_1','run_id':'b'*32},'call_id':'conflict'})
+    assert result['tool_trail'][-1]['arguments']['run_id']=='b'*32
+
+
+def test_daily_tool_binds_identity_and_never_corrects_conflicting_scope():
+    from src.tools.mcp import FrozenDailyReviewEvidenceTool
+    from types import SimpleNamespace
+    calls=[]
+    remote=SimpleNamespace(name='mcp_trading_copilot_tc_get_daily_review_evidence',execute=lambda **kwargs:calls.append(kwargs) or json.dumps({'status':'ok','payload':kwargs}))
+    first=FrozenDailyReviewEvidenceTool(remote,'a'*32)
+    second=FrozenDailyReviewEvidenceTool(remote,'b'*32)
+    assert set(first.parameters['properties'])=={'source_id'}
+    assert first.parameters['required']==['source_id']
+    assert first.is_readonly and first.repeatable
+    assert json.loads(first.execute(source_id='overview_1'))['payload']['run_id']=='a'*32
+    assert json.loads(second.execute(source_id='coverage_1'))['payload']['run_id']=='b'*32
+    assert json.loads(first.execute(source_id='overview_1',run_id='b'*32))['status']=='error'
+    assert json.loads(first.execute(source_id='overview_1',unsafe='value'))['status']=='error'
+    assert len(calls)==2
+    for invalid in (None,'','a'*31,'b'*33,'not-a-run'):
+        with pytest.raises(ValueError,match='run_id_required'):
+            FrozenDailyReviewEvidenceTool(remote,invalid)
+    with pytest.raises(ValueError,match='tool_unavailable'):
+        FrozenDailyReviewEvidenceTool(SimpleNamespace(name='write_tool'),'a'*32)
 
 
 def test_sole_repair_can_keep_both_complete_reads_without_trimming():
