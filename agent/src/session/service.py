@@ -539,6 +539,11 @@ class SessionService:
             tool = registry.get("mcp_trading_copilot_tc_get_daily_review_evidence")
             if tool is None:
                 raise ValueError("frozen_daily_review_tool_unavailable")
+            # This exact tool reads immutable, scoped evidence only. MCP tools
+            # remain conservative by default; identifying this one as readonly
+            # allows the existing bounded parallel executor to page the day
+            # without serial connection startup consuming the repair deadline.
+            tool.is_readonly = True
             scoped.register(tool)
             registry = scoped
 

@@ -44,6 +44,7 @@ def test_daily_session_disables_unscoped_memory_and_enables_context_retention(mo
     assert result['status']=='completed'
     assert observed['persistent_memory'] is None and observed['frozen_review_context'] is True
     assert set(observed['registry']._tools)=={'mcp_trading_copilot_tc_get_daily_review_evidence'}
+    assert observed['registry'].get('mcp_trading_copilot_tc_get_daily_review_evidence').is_readonly is True
 
 
 def test_sole_repair_can_keep_both_complete_reads_without_trimming():
@@ -81,3 +82,44 @@ def test_agent_sees_every_prior_page_at_synthesis(monkeypatch,tmp_path:Path,page
     result=agent.run('Read the entire day then synthesize')
     assert result['status']=='success', result
     assert spy.calls==page_count+1
+
+
+
+def test_readonly_frozen_pages_execute_concurrently_without_losing_order(tmp_path):
+    import threading
+    from types import SimpleNamespace
+    from src.agent.loop import AgentLoop
+    from src.agent.tools import ToolRegistry, BaseTool
+
+    gate = threading.Barrier(4)
+    class Source(BaseTool):
+        name = "frozen_source"
+        repeatable = True
+        is_readonly = True
+        parameters = {"type": "object", "properties": {"page": {"type": "integer"}}, "required": ["page"]}
+        def execute(self, **kwargs):
+            # This fails if the known-readonly source regresses to serial reads.
+            gate.wait(timeout=3)
+            return json.dumps({"status": "ok", "page": kwargs["page"], "evidence": "retained"})
+
+    class Spy:
+        calls = 0
+        def stream_chat(self, messages, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(has_tool_calls=True, content=None, reasoning_content=None,
+                    tool_calls=[SimpleNamespace(id=str(i), name="frozen_source", arguments={"page": i}) for i in range(4)])
+            pages = [json.loads(m["content"]) for m in messages if m["role"] == "tool"]
+            assert pages == [{"status": "ok", "page": i, "evidence": "retained"} for i in range(4)]
+            return SimpleNamespace(has_tool_calls=False, content="complete evidence synthesis")
+
+    spy = Spy()
+    registry = ToolRegistry()
+    registry.register(Source())
+    agent = AgentLoop(registry=registry, llm=spy, frozen_review_context=True, max_iterations=3)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    agent.memory.run_dir = str(run_dir)
+    result = agent.run("Read the immutable pages")
+    assert result["status"] == "success"
+    assert spy.calls == 2
