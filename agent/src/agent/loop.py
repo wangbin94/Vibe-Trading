@@ -529,8 +529,18 @@ def _replay_context_result(result: str) -> str:
 
 
 
+# Two retained full-day reads: initial draft and its sole permitted repair.
+# The real 62-page replay is 461k characters including system/tool envelopes.
+FROZEN_REVIEW_CONTEXT_MAX_CHARS = 960_000
+
+
 def _bound_frozen_review_context(messages: list) -> None:
-    if len(json.dumps(messages, default=str, ensure_ascii=False)) > 320_000:
+    size = len(json.dumps(messages, default=str, ensure_ascii=False))
+    if size > FROZEN_REVIEW_CONTEXT_MAX_CHARS:
+        logger.warning(
+            "Frozen review context exceeds limit: %s > %s characters",
+            size, FROZEN_REVIEW_CONTEXT_MAX_CHARS,
+        )
         raise ValueError("frozen_review_context_budget_exceeded")
 
 

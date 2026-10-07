@@ -4,7 +4,7 @@ import json
 from copy import deepcopy
 from pathlib import Path
 import pytest
-from src.agent.loop import _bound_frozen_review_context, _microcompact, _context_collapse
+from src.agent.loop import _bound_frozen_review_context, _microcompact, _context_collapse, FROZEN_REVIEW_CONTEXT_MAX_CHARS
 from src.session.models import Attempt
 from src.session.service import SessionService
 from src.session.store import SessionStore
@@ -20,7 +20,7 @@ def test_complete_34_page_context_is_preserved_and_bounded():
     normal=deepcopy(messages);_microcompact(normal);_context_collapse(normal)
     assert normal != original
     with pytest.raises(ValueError,match='budget_exceeded'):
-        _bound_frozen_review_context([{'content':'x'*320001}])
+        _bound_frozen_review_context([{'content':'x'*(FROZEN_REVIEW_CONTEXT_MAX_CHARS+1)}])
 
 
 def test_daily_session_disables_unscoped_memory_and_enables_context_retention(monkeypatch,tmp_path:Path):
@@ -46,7 +46,18 @@ def test_daily_session_disables_unscoped_memory_and_enables_context_retention(mo
     assert set(observed['registry']._tools)=={'mcp_trading_copilot_tc_get_daily_review_evidence'}
 
 
-def test_agent_sees_every_prior_page_at_synthesis(monkeypatch,tmp_path:Path):
+def test_sole_repair_can_keep_both_complete_reads_without_trimming():
+    messages=[{'role':'system','content':'x'*40000},{'role':'user','content':'x'*7000}]
+    for attempt in (1,2):
+        messages.append({'role':'assistant','provider_items':[{'encrypted_content':'x'*15000}]})
+        messages.extend({'role':'tool','name':'mcp_trading_copilot_tc_get_daily_review_evidence','content':json.dumps({'source_id':f'page_{i}','payload':{'evidence':'x'*6500},'metadata':'x'*300}),'tool_call_id':f'{attempt}_{i}'} for i in range(62))
+    original=deepcopy(messages)
+    _bound_frozen_review_context(messages)
+    assert messages==original
+
+
+@pytest.mark.parametrize('page_count', [34, 62])
+def test_agent_sees_every_prior_page_at_synthesis(monkeypatch,tmp_path:Path,page_count):
     from types import SimpleNamespace
     from src.agent.loop import AgentLoop
     from src.agent.tools import ToolRegistry, BaseTool
@@ -61,12 +72,12 @@ def test_agent_sees_every_prior_page_at_synthesis(monkeypatch,tmp_path:Path):
             pages=[m for m in messages if m['role']=='tool']
             assert all('page_'+str(i) in page['content'] for i,page in enumerate(pages))
             self.calls+=1
-            if self.calls==35:
-                assert len(pages)==34
+            if self.calls==page_count+1:
+                assert len(pages)==page_count
                 return SimpleNamespace(has_tool_calls=False,content='complete evidence synthesis')
             return SimpleNamespace(has_tool_calls=True,content=None,reasoning_content=None,tool_calls=[SimpleNamespace(id=str(self.calls),name='frozen_source',arguments={'page':self.calls-1})])
-    spy=Spy();registry=ToolRegistry();registry.register(Source());agent=AgentLoop(registry=registry,llm=spy,frozen_review_context=True,max_iterations=40)
+    spy=Spy();registry=ToolRegistry();registry.register(Source());agent=AgentLoop(registry=registry,llm=spy,frozen_review_context=True,max_iterations=page_count+6)
     run_dir=tmp_path/'run';run_dir.mkdir();agent.memory.run_dir=str(run_dir)
     result=agent.run('Read the entire day then synthesize')
     assert result['status']=='success', result
-    assert spy.calls==35
+    assert spy.calls==page_count+1
