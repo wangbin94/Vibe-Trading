@@ -152,3 +152,75 @@ def test_readonly_frozen_pages_execute_concurrently_without_losing_order(tmp_pat
     result = agent.run("Read the immutable pages")
     assert result["status"] == "success"
     assert spy.calls == 2
+
+
+def test_frozen_greek_draft_reaches_external_validator_without_price_recovery(monkeypatch, tmp_path):
+    """A price gate must not replace valid typed Greek evidence with a refusal."""
+    from types import SimpleNamespace
+    from src.agent.loop import AgentLoop
+    from src.agent.tools import BaseTool, ToolRegistry
+
+    memo = "Frozen local estimates: delta -4.5; theta +12.5. Intent remains a hypothesis."
+
+    class Source(BaseTool):
+        name = "mcp_trading_copilot_tc_get_daily_review_evidence"
+        is_readonly = True
+        parameters = {"type": "object", "properties": {}}
+
+        def execute(self, **kwargs):
+            return json.dumps({"status": "ok", "payload": {
+                "source_id": "trades_1", "evidence": {
+                    "T01": {"trade_greek_effect": {"delta": -4.5, "theta": 12.5}}
+                }
+            }})
+
+    class Model:
+        calls = 0
+
+        def stream_chat(self, messages, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(has_tool_calls=True, content=None, reasoning_content=None,
+                    tool_calls=[SimpleNamespace(id="read", name=Source.name, arguments={})])
+            assert self.calls == 2, "Frozen review unexpectedly made an internal repair/recovery"
+            assert any(message["role"] == "tool" for message in messages)
+            return SimpleNamespace(has_tool_calls=False, content=memo)
+
+    def forbidden_ledger(**kwargs):
+        pytest.fail("Frozen evidence must be validated by its external owner, not a price ledger")
+
+    monkeypatch.setattr("src.agent.loop.GroundingLedger", forbidden_ledger)
+    registry = ToolRegistry()
+    registry.register(Source())
+    model = Model()
+    loop = AgentLoop(registry=registry, llm=model, frozen_review_context=True, max_iterations=4)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    loop.memory.run_dir = str(run_dir)
+    result = loop.run("Analyze only the frozen Greek estimates")
+    assert result["status"] == "success"
+    assert result["content"] == memo
+    assert model.calls == 2
+    manifest = json.loads((run_dir / "run_manifest.json").read_text())
+    assert manifest["extra"]["grounding_owner"] == "trading_copilot"
+
+
+def test_ordinary_session_still_withholds_unsupported_market_price(tmp_path):
+    from types import SimpleNamespace
+    from src.agent.loop import AgentLoop
+    from src.agent.tools import ToolRegistry
+
+    unsupported = "The observed SPY market price is $123.45."
+    class Model:
+        def stream_chat(self, messages, **kwargs):
+            return SimpleNamespace(has_tool_calls=False, content=unsupported)
+
+    loop = AgentLoop(registry=ToolRegistry(), llm=Model(), max_iterations=2)
+    run_dir = tmp_path / "ordinary"
+    run_dir.mkdir()
+    loop.memory.run_dir = str(run_dir)
+    result = loop.run("What is the current SPY market price?")
+    assert result["content"] != unsupported
+    assert "123.45" not in result["content"]
+    manifest = json.loads((run_dir / "run_manifest.json").read_text())
+    assert manifest["extra"]["grounding_owner"] == "vibe"

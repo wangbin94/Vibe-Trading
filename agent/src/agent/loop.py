@@ -1067,6 +1067,7 @@ class AgentLoop:
                 tool_names=list(self.registry.tool_names),
                 package_versions=collect_key_package_versions(),
                 extra={
+                    "grounding_owner": "trading_copilot" if self._frozen_review_context else "vibe",
                     "skill_coverage": (
                         "skills injected at context-build time are inside the "
                         "hashed system prompt; skills loaded mid-run via "
@@ -1153,7 +1154,11 @@ class AgentLoop:
             self.memory.run_dir = str(run_dir)
 
         state_store.save_request(run_dir, user_message, {"session_id": session_id})
-        self._grounding = GroundingLedger(
+        # Frozen daily review has one external validation owner: Trading Copilot.
+        # The generic price ledger cannot interpret its typed Greek/position
+        # evidence and may inject recovery tools forbidden by the scoped session.
+        # Keep its original draft intact for the caller's strict validator.
+        self._grounding = None if self._frozen_review_context else GroundingLedger(
             run_dir=run_dir,
             user_message=user_message,
             history=history,
