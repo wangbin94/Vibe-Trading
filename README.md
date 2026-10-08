@@ -2272,3 +2272,18 @@ MIT License — see [LICENSE](LICENSE)
 <p align="center">
   <img src="https://visitor-badge.laobi.icu/badge?page_id=HKUDS.Vibe-Trading&style=flat" alt="visitors"/>
 </p>
+
+### Frozen daily-review validation ownership
+
+The Trading Copilot integration scopes `frozen_review_context` sessions to its
+server-bound, read-only frozen evidence tool and excludes global personal memory.
+Trading Copilot owns validation of the resulting report: authenticated references,
+metric/sign/scope/provenance, temporal boundaries and publication. Vibe returns the
+original draft to that validator without applying its generic market-price ledger.
+That ledger cannot interpret typed position/Greek evidence and must not replace a
+frozen review with recovery instructions for unavailable live-data tools.
+
+Ordinary Vibe sessions retain market-price grounding and recovery. A frozen draft
+is not a validated report; diagnostic prose still needs a separate audit and must
+not be automatically published or promoted to memory. The run manifest records
+which application owns grounding.
